@@ -37,3 +37,27 @@ func Decode32u(p []byte, l *uint32) []byte {
 	*l = binary.BigEndian.Uint32(p)
 	return p[4:]
 }
+
+/* encode 64 bits unsigned int (lsb) */
+func Encode64u(p []byte, l uint64) []byte {
+	binary.BigEndian.PutUint64(p, l)
+	return p[8:]
+}
+
+/* decode 64 bits unsigned int (lsb) */
+func Decode64u(p []byte, l *uint64) []byte {
+	*l = binary.BigEndian.Uint64(p)
+	return p[8:]
+}
+
+/* encode 64 bits int (lsb) */
+func Encode64(p []byte, l int64) []byte {
+	binary.BigEndian.PutUint64(p, uint64(l))
+	return p[8:]
+}
+
+/* decode 64 bits int (lsb) */
+func Decode64(p []byte, l *int64) []byte {
+	*l = int64(binary.BigEndian.Uint64(p))
+	return p[8:]
+}

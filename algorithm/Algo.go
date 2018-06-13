@@ -69,8 +69,7 @@ func (self *algoImpl) Init(connect net.Conn, owner uint32, packLength uint16) {
 
 	self.confirmChan = make(chan uint32, 1024)
 
-	Safe.Go(self.runConfirm)
-	Safe.Go(self.runReceive)
+	Safe.Go(self.run)
 }
 
 func (self *algoImpl) Close() error {
@@ -78,7 +77,16 @@ func (self *algoImpl) Close() error {
 		return nil
 	}
 	atomic.AddInt32(&self.isRunning, 1)
+	closeBytes, _ := PackCloseBytes(&ClosePackage{
+		Owner: self.owner,
+	})
+	self.connect.Write(closeBytes)
+	self.connect.Close()
+	self.connect = nil
+	self.sendList = nil
+	self.receiveMap = nil
 	close(self.receiveChan)
+	close(self.confirmChan)
 	return nil
 }
 
@@ -150,135 +158,192 @@ func (self *algoImpl) Remain() int {
 	return self.sendList.Len()
 }
 
-func (self *algoImpl) runReceive() {
-	for 0 == atomic.LoadInt32(&self.isRunning) {
-		buffer := make([]byte, 2048)
-		n, err := self.connect.Read(buffer)
-		if nil != err {
-			SLog.E(err)
-			break
-		}
-		var packType byte
-		buffer = ByteOpt.Decode8u(buffer[:n], &packType)
-		switch packType {
-		case PackType_Data:
-			var dataPackage DataPackage
-			err := UnPackData(&dataPackage, buffer)
-			if nil != err {
-				SLog.E(err)
-				break
-			}
-			self.confirmChan <- dataPackage.Index
-			combiner, ok := self.receiveMap[dataPackage.Key]
-			if !ok {
-				combiner = &Combiner{}
-				combiner.Init(dataPackage.KCount)
-				self.receiveMap[dataPackage.Key] = combiner
-			}
-			if combiner.Push(&dataPackage) {
-				if nil != self.receiveChan {
-					self.receiveChan <- combiner.Bytes()
-				}
-				delete(self.receiveMap, dataPackage.Key)
-			}
-			break
-		case PackType_Confim:
-			var confirmPackage ConfirmPackage
-			err := UnPackConfirm(&confirmPackage, buffer)
-			if nil != err {
-				SLog.E(err)
-				break
-			}
-			confirmPackage.IndexArray.Sort()
-			func() {
-				self.sendLocker.Lock()
-				defer self.sendLocker.Unlock()
-
-				for elem := self.sendList.Front(); nil != elem; {
-					current := elem
-					elem = elem.Next()
-
-					info := current.Value.(*sendInfo)
-
-					index := sort.Search(len(confirmPackage.IndexArray), func(i int) bool {
-						return confirmPackage.IndexArray[i] >= info.Index
-					})
-					if index >= len(confirmPackage.IndexArray) {
-						continue
-					}
-					if confirmPackage.IndexArray[index] == info.Index {
-						self.sendList.Remove(current)
-					}
-				}
-			}()
-			break
-		case PackType_Close:
-			self.Close()
-			break
-		default:
-			break
-		}
+func (self *algoImpl) processDataPackage(buffer []byte) error {
+	var dataPackage DataPackage
+	err := UnPackData(&dataPackage, buffer)
+	if nil != err {
+		SLog.E(err)
+		return err
 	}
-	SLog.D("End")
+	self.confirmChan <- dataPackage.Index
+	combiner, ok := self.receiveMap[dataPackage.Key]
+	if !ok {
+		combiner = &Combiner{}
+		combiner.Init(dataPackage.KCount)
+		self.receiveMap[dataPackage.Key] = combiner
+	}
+	if combiner.Push(&dataPackage) {
+		if nil != self.receiveChan {
+			self.receiveChan <- combiner.Bytes()
+		}
+		delete(self.receiveMap, dataPackage.Key)
+	}
+	return nil
 }
 
-func (self *algoImpl) runConfirm() {
-	duration := time.Millisecond * 100
-	confirmTimer := time.NewTimer(time.Millisecond * 100)
-	arrayLength := 128
-	indexArray := make([]uint32, arrayLength)
-	confirmMsg := ConfirmPackage{
-		Owner:      self.owner,
-		IndexArray: make([]uint32, arrayLength),
+func (self *algoImpl) processConfirmPackage(buffer []byte) error {
+	var confirmPackage ConfirmPackage
+	err := UnPackConfirm(&confirmPackage, buffer)
+	if nil != err {
+		SLog.E(err)
+		return err
 	}
-	confirmIndex := 0
-	sendConfirm := func(msg *ConfirmPackage) {
-		packBytes, err := PackConfirmBytes(msg)
-		if nil != err {
-			SLog.E(err)
-			return
+	confirmPackage.IndexArray.Sort()
+
+	self.sendLocker.Lock()
+	defer self.sendLocker.Unlock()
+
+	for elem := self.sendList.Front(); nil != elem; {
+		current := elem
+		elem = elem.Next()
+
+		info := current.Value.(*sendInfo)
+
+		index := sort.Search(len(confirmPackage.IndexArray), func(i int) bool {
+			return confirmPackage.IndexArray[i] >= info.Index
+		})
+		if index >= len(confirmPackage.IndexArray) {
+			continue
 		}
-		self.connect.Write(packBytes)
+		if confirmPackage.IndexArray[index] == info.Index {
+			self.sendList.Remove(current)
+		}
 	}
+	return nil
+}
+
+func (self *algoImpl) sendConfirm(indexArray []uint32) error {
+	packBytes, err := PackConfirmBytes(&ConfirmPackage{
+		Owner:      self.owner,
+		IndexArray: indexArray,
+	})
+	if nil != err {
+		SLog.E(err)
+		return err
+	}
+	self.connect.Write(packBytes)
+	return nil
+}
+
+func (self *algoImpl) resendMsg() {
+	currentTime := time.Now()
+	self.sendLocker.RLock()
+	defer self.sendLocker.RUnlock()
+
+	for e := self.sendList.Front(); nil != e; e = e.Next() {
+		info := e.Value.(*sendInfo)
+		if info.NextSend.Before(currentTime) {
+			self.connect.Write(info.Msg)
+			info.NextSend = info.NextSend.Add(NextSendDuration)
+		}
+	}
+}
+
+type confirmArrayHelper struct {
+	data   []uint32
+	length int
+}
+
+func (self *confirmArrayHelper) Reset() {
+	self.length = 0
+}
+func (self *confirmArrayHelper) Add(value uint32) {
+	self.data[self.length] = value
+	self.length++
+}
+func (self *confirmArrayHelper) IsFull() bool {
+	return self.length >= len(self.data)
+}
+func (self *confirmArrayHelper) IsEmpty() bool {
+	return 0 == self.length
+}
+func (self *confirmArrayHelper) ToSlice() []uint32 {
+	return self.data[:self.length]
+}
+
+func (self *algoImpl) run() {
+	confirmDuration := time.Millisecond * 100 //每100ms强制检测发送一次确认消息
+	confirmTimer := time.NewTimer(confirmDuration)
+
+	resendDuration := time.Millisecond * 10 //每10ms检测一次消息重传
+	resendTimer := time.NewTimer(resendDuration)
+
+	tickDuration := time.Second * 10 //每10s发送一次连接包
+	tickTimer := time.NewTimer(0)
+	tickCount := int32(0)
+
+	arrayHelper := confirmArrayHelper{data: make([]uint32, 128), length: 0}
+
+	Safe.Go(func() {
+		for 0 == atomic.LoadInt32(&self.isRunning) {
+			buffer := make([]byte, 2048)
+			n, err := self.connect.Read(buffer)
+			if nil != err {
+				SLog.E(err)
+				break
+			}
+			var packType byte
+			buffer = ByteOpt.Decode8u(buffer[:n], &packType)
+			switch packType {
+			case PackType_Data:
+				self.processDataPackage(buffer)
+			case PackType_Confim:
+				self.processConfirmPackage(buffer)
+			case PackType_Close:
+				self.Close()
+			case PackType_Tick:
+				var tickPackage TickPackage
+				UnPackTickPackage(&tickPackage, buffer)
+				echoBytes, _ := PackEchoTickPackage(&EchoTickPackage{
+					Owner: tickPackage.Owner,
+					NSec:  tickPackage.NSec,
+				})
+				self.connect.Write(echoBytes)
+			case PackType_EchoTick:
+				atomic.StoreInt32(&tickCount, 0)
+				var echoTickPackage EchoTickPackage
+				UnPackEchoTickPackage(&echoTickPackage, buffer)
+				pre := time.Unix(0, echoTickPackage.NSec)
+				current := time.Now()
+				SLog.D(time.Now().Sub(pre), pre, current)
+			default:
+			}
+		}
+	})
 	for 0 == atomic.LoadInt32(&self.isRunning) {
 		select {
 		case index, ok := <-self.confirmChan:
 			if ok {
-				indexArray[confirmIndex] = index
-				confirmIndex++
-				if confirmIndex >= len(confirmMsg.IndexArray) {
-					confirmMsg.IndexArray = indexArray[:confirmIndex]
-					sendConfirm(&confirmMsg)
-					for innerIndex := 0; innerIndex < len(indexArray); innerIndex++ {
-						indexArray[innerIndex] = 0
-					}
-					confirmIndex = 0
+				arrayHelper.Add(index)
+				if arrayHelper.IsFull() {
+					self.sendConfirm(arrayHelper.ToSlice())
+					arrayHelper.Reset()
 				}
 			}
 		case <-confirmTimer.C:
-			if confirmIndex > 0 {
-				confirmMsg.IndexArray = indexArray[:confirmIndex]
-				sendConfirm(&confirmMsg)
-				for innerIndex := 0; innerIndex < len(indexArray); innerIndex++ {
-					indexArray[innerIndex] = 0
-				}
-				confirmIndex = 0
+			if !arrayHelper.IsEmpty() {
+				self.sendConfirm(arrayHelper.ToSlice())
+				arrayHelper.Reset()
 			}
-			confirmTimer.Reset(duration)
-		default:
-			currentTime := time.Now()
-			func() {
-				self.sendLocker.RLock()
-				defer self.sendLocker.RUnlock()
-
-				for e := self.sendList.Front(); nil != e; e = e.Next() {
-					info := e.Value.(*sendInfo)
-					if info.NextSend.Before(currentTime) {
-						self.connect.Write(info.Msg)
-						info.NextSend = info.NextSend.Add(NextSendDuration)
-					}
-				}
-			}()
+			confirmTimer.Reset(confirmDuration)
+		case <-resendTimer.C:
+			self.resendMsg()
+			resendTimer.Reset(resendDuration)
+		case <-tickTimer.C:
+			nowTick := atomic.AddInt32(&tickCount, 1)
+			if nowTick > 3 {
+				self.Close()
+				SLog.D("Close")
+			} else {
+				current := time.Now()
+				tickBytes, _ := PackTickPackage(&TickPackage{
+					Owner: self.owner,
+					NSec:  current.UnixNano(),
+				})
+				self.connect.Write(tickBytes)
+				SLog.D(current, "Tick")
+			}
+			tickTimer.Reset(time.Duration(float32(tickDuration) * (1.0 / float32(nowTick))))
 		}
 	}
 }

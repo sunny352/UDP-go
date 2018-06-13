@@ -7,9 +7,11 @@ import (
 )
 
 const (
-	PackType_Data   byte = 0
-	PackType_Confim      = 1
-	PackType_Close       = 2
+	PackType_Data     byte = 0
+	PackType_Confim        = 1
+	PackType_Close         = 2
+	PackType_Tick          = 4
+	PackType_EchoTick      = 5
 )
 
 type DataPackage struct {
@@ -110,5 +112,45 @@ func PackCloseBytes(closePackage *ClosePackage) ([]byte, error) {
 
 func UnPackClose(closePackage *ClosePackage, buffer []byte) error {
 	buffer = ByteOpt.Decode32u(buffer, &closePackage.Owner)
+	return nil
+}
+
+type TickPackage struct {
+	Owner uint32
+	NSec  int64
+}
+
+func PackTickPackage(tickPackage *TickPackage) ([]byte, error) {
+	buffer := make([]byte, 1+4+8)
+	temp := buffer
+	temp = ByteOpt.Encode8u(temp, PackType_Tick)
+	temp = ByteOpt.Encode32u(temp, tickPackage.Owner)
+	temp = ByteOpt.Encode64(temp, tickPackage.NSec)
+	return buffer, nil
+}
+
+func UnPackTickPackage(tickPackage *TickPackage, buffer []byte) error {
+	buffer = ByteOpt.Decode32u(buffer, &tickPackage.Owner)
+	buffer = ByteOpt.Decode64(buffer, &tickPackage.NSec)
+	return nil
+}
+
+type EchoTickPackage struct {
+	Owner uint32
+	NSec  int64
+}
+
+func PackEchoTickPackage(echoTickPackage *EchoTickPackage) ([]byte, error) {
+	buffer := make([]byte, 1+4+8)
+	temp := buffer
+	temp = ByteOpt.Encode8u(temp, PackType_EchoTick)
+	temp = ByteOpt.Encode32u(temp, echoTickPackage.Owner)
+	temp = ByteOpt.Encode64(temp, echoTickPackage.NSec)
+	return buffer, nil
+}
+
+func UnPackEchoTickPackage(echoTickPackage *EchoTickPackage, buffer []byte) error {
+	buffer = ByteOpt.Decode32u(buffer, &echoTickPackage.Owner)
+	buffer = ByteOpt.Decode64(buffer, &echoTickPackage.NSec)
 	return nil
 }
